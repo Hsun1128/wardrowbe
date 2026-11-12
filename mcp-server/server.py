@@ -51,6 +51,8 @@ MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8090"))
 # Phone photos run 3-8 MB; the backend applies its own MAX_UPLOAD_SIZE_MB on top.
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# Room for the multipart boundary and part headers around the image itself.
+UPLOAD_FORM_OVERHEAD_BYTES = 64 * 1024
 
 wardrobe = WardrobeBackend(
     os.environ.get("WARDROBE_API_BASE", "http://127.0.0.1:8000"),
@@ -791,16 +793,25 @@ async def upload(request: Request) -> JSONResponse:
     identity = _identity_for_request(request)
     if identity is None:  # BearerAuth already checked; kept so the route is safe on its own.
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+    too_large = JSONResponse({"error": "Image is larger than 25 MB"}, status_code=413)
+    # Refuse before reading anything. The form parser spools the whole body to
+    # disk, so a request with no declared length could otherwise grow without
+    # bound; the HTTP server holds a request to the length it declares.
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
-        return JSONResponse({"error": "Image is larger than 25 MB"}, status_code=413)
-    form = await request.form()
+    if not declared.isdigit():
+        return JSONResponse({"error": "Content-Length is required"}, status_code=411)
+    if int(declared) > MAX_UPLOAD_BYTES + UPLOAD_FORM_OVERHEAD_BYTES:
+        return too_large
+    form = await request.form(max_files=1, max_fields=8)
     image = form.get("image")
     if image is None or isinstance(image, str):
         return JSONResponse({"error": "Send the photo as a multipart field named 'image'"}, status_code=400)
-    content = await image.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        return JSONResponse({"error": "Image is larger than 25 MB"}, status_code=413)
+    body = bytearray()
+    while chunk := await image.read(1024 * 1024):
+        body.extend(chunk)
+        if len(body) > MAX_UPLOAD_BYTES:
+            return too_large
+    content = bytes(body)
     filename = image.filename or "photo.jpg"
     try:
         item = await wardrobe.request(
