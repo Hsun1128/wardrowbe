@@ -1,0 +1,14 @@
+{
+  "users": [
+    {
+      "name": "Alex",
+      "email": "alex@wardrowbe.local",
+      "token": "generate with: openssl rand -hex 32"
+    },
+    {
+      "name": "Sam",
+      "email": "sam@wardrowbe.local",
+      "token": "a different one per person"
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+# Home-LAN override: the whole stack plus the MCP server, reachable from other
+# devices on the same network.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml exec backend alembic upgrade head
+#
+# What is exposed to the LAN:
+#   http://${LAN_HOST}:${FRONTEND_PORT}   web UI
+#   http://${LAN_HOST}:${MCP_PORT}/mcp    MCP server (Streamable HTTP, per-user Bearer token)
+# The backend API, Postgres and Redis are bound to 127.0.0.1 only: the web UI and the
+# MCP server reach the backend over the compose network, so nothing else needs them.
+#
+# Backend and frontend are built from this checkout as production images, under
+# their own local tags: the backend because this fork adds image_url/source_url to
+# POST /api/v1/items, the frontend so it always matches that backend. (The
+# ghcr.io/... tags are left alone; docker-compose.dev.yml rebuilds those as dev images.)
+#
+# Auth here is the backend's dev mode (DEBUG=true, no OIDC): anyone who can open the
+# web UI can sign in as any email. That is acceptable on a trusted home network and
+# nowhere else. Do not port-forward this stack to the internet.
+
+x-backend-build: &backend-build
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  image: wardrowbe-backend:local
+
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    ports: !override
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+
+  backend:
+    <<: *backend-build
+    ports: !override
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+
+  worker:
+    <<: *backend-build
+
+  image-worker:
+    <<: *backend-build
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: wardrowbe-frontend:local
+    environment:
+      NEXTAUTH_URL: http://${LAN_HOST:?set LAN_HOST in .env}:${FRONTEND_PORT:-3000}
+
+  mcp:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    image: wardrowbe-mcp:local
+    container_name: wardrobe-mcp
+    environment:
+      WARDROBE_API_BASE: http://backend:8000
+      # Image links in tool results are rewritten to this origin so the client can open them.
+      WARDROBE_PUBLIC_URL: http://${LAN_HOST:?set LAN_HOST in .env}:${FRONTEND_PORT:-3000}
+      MCP_TRANSPORT: http
+      MCP_USERS_FILE: /config/users.json
+    volumes:
+      - ./mcp-server/users.json:/config/users.json:ro
+    ports:
+      - "${MCP_PORT:-8090}:8090"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

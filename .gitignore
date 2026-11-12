@@ -65,3 +65,6 @@ testing/
 .playwright-mcp
 *.review.yml
 *-test.yml
+
+# MCP server: per-user tokens
+mcp-server/users.json
