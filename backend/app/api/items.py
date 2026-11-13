@@ -213,6 +213,8 @@ async def create_item(
     formality: str | None = Form(None),
     fit: str | None = Form(None),
     source_url: str | None = Form(None, description="Product page the item was added from"),
+    size: str | None = Form(None, max_length=32),
+    care_instructions: str | None = Form(None, max_length=255),
 ) -> ItemResponse:
     if (image is None) == (image_url is None):
         raise HTTPException(
@@ -275,7 +277,7 @@ async def create_item(
     # the photo). Only built when at least one field is present, so skip_ai=false still
     # leaves tags empty for the internal AI to fill in as before.
     manual_tags: ItemTags | None = None
-    if any([pattern, material, style_list, season_list, formality, fit, source_url]):
+    if any([pattern, material, style_list, season_list, formality, fit, source_url, size, care_instructions]):
         manual_tags = ItemTags(
             colors=color_list or [],
             primary_color=primary_color,
@@ -286,6 +288,8 @@ async def create_item(
             formality=formality,
             fit=fit,
             source_url=source_url,
+            size=size,
+            care_instructions=care_instructions,
         )
 
     # Create item - use "unknown" if type not provided (AI will detect)
@@ -2014,8 +2018,17 @@ async def add_item_image(
     item_id: UUID,
     db: DbSession,
     current_user: Annotated[User, Depends(get_current_user)],
-    image: UploadFile = File(...),
+    image: UploadFile | None = File(None),
+    image_url: str | None = Form(
+        None, description="Fetch the image from this URL instead of uploading bytes; exactly one of image/image_url is required"
+    ),
 ) -> ItemImageResponse:
+    if (image is None) == (image_url is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide exactly one of image or image_url",
+        )
+
     item_service = ItemService(db)
     item = await item_service.get_by_id(item_id, current_user.id)
 
@@ -2036,8 +2049,13 @@ async def add_item_image(
 
     # Process image
     image_service_inst = ImageService()
-    content = await _read_image_or_413(image)
-    content_type = image.content_type or "application/octet-stream"
+    if image_url is not None:
+        content, content_type = await fetch_image_from_url(image_url)
+        original_filename = "product" + (mimetypes.guess_extension(content_type) or ".jpg")
+    else:
+        content = await _read_image_or_413(image)
+        content_type = image.content_type or "application/octet-stream"
+        original_filename = image.filename or "upload.jpg"
 
     if not image_service_inst.validate_image(content, content_type):
         raise HTTPException(
@@ -2049,7 +2067,7 @@ async def add_item_image(
         image_paths = await image_service_inst.process_and_store(
             user_id=current_user.id,
             image_data=content,
-            original_filename=image.filename or "upload.jpg",
+            original_filename=original_filename,
         )
     except ValueError as e:
         raise HTTPException(

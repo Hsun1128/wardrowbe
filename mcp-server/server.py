@@ -258,10 +258,14 @@ def _item_form(
     formality: str,
     fit: str,
     source_url: str = "",
+    subtype: str = "",
+    size: str = "",
+    care_instructions: str = "",
 ) -> dict[str, str]:
     """Form fields for POST /api/v1/items with caller-judged tags (skip_ai=true)."""
     fields = {
         "type": item_type,
+        "subtype": subtype,
         "name": name,
         "brand": brand,
         "notes": notes,
@@ -274,6 +278,8 @@ def _item_form(
         "formality": formality,
         "fit": fit,
         "source_url": source_url,
+        "size": size,
+        "care_instructions": care_instructions,
     }
     return {"skip_ai": "true", **{key: value for key, value in fields.items() if value}}
 
@@ -282,6 +288,58 @@ def _image_content_type(filename: str) -> str:
     # The backend checks the MIME type against an allowlist before opening the
     # bytes, so a generic octet-stream upload is rejected.
     return mimetypes.guess_type(filename)[0] or "image/jpeg"
+
+
+def _resolve_image_bytes(image_path: str, image_base64: str, filename: str) -> tuple[bytes, str]:
+    """Read image bytes from exactly one of a local path or base64, returning (content, filename).
+
+    image_path is only honored over stdio (one local client, one filesystem); over
+    HTTP there is no shared filesystem to resolve it against.
+    """
+    if bool(image_path) == bool(image_base64):
+        raise ValueError("Provide exactly one of image_path or image_base64")
+    if image_path:
+        if STDIO_IDENTITY is None:
+            raise ValueError(
+                "image_path is only available over stdio; over HTTP send image_base64, "
+                "image_url, or use POST /upload"
+            )
+        path = Path(image_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"No such image file: {path}")
+        return path.read_bytes(), path.name
+    try:
+        return base64.b64decode(image_base64, validate=True), filename
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"image_base64 is not valid base64: {e}") from e
+
+
+async def _attach_extra_images(
+    ctx: Context,
+    item_id: str,
+    extra_image_paths: Optional[list[str]],
+    extra_image_urls: Optional[list[str]],
+    extra_image_base64: Optional[list[str]] = None,
+) -> None:
+    """Add additional photos (beyond the primary one) to a just-created item, in order.
+
+    Each call is independent so one bad path, URL or base64 blob does not lose the
+    others; the item itself already exists by the time this runs.
+    """
+    for path in extra_image_paths or []:
+        content, filename = _resolve_image_bytes(path, "", "photo.jpg")
+        await _call(
+            ctx, "POST", f"/items/{item_id}/images",
+            files={"image": (filename, content, _image_content_type(filename))},
+        )
+    for url in extra_image_urls or []:
+        await _call(ctx, "POST", f"/items/{item_id}/images", data={"image_url": url})
+    for blob in extra_image_base64 or []:
+        content, filename = _resolve_image_bytes("", blob, "photo.jpg")
+        await _call(
+            ctx, "POST", f"/items/{item_id}/images",
+            files={"image": (filename, content, _image_content_type(filename))},
+        )
 
 
 # ─── status ──────────────────────────────────────────────────────────────────
@@ -376,6 +434,7 @@ async def add_clothing_item(
     image_path: str = "",
     name: str = "",
     brand: str = "",
+    subtype: str = "",
     color: str = "",
     colors: Optional[list[str]] = None,
     style: Optional[list[str]] = None,
@@ -384,13 +443,18 @@ async def add_clothing_item(
     pattern: str = "",
     formality: str = "",
     fit: str = "",
+    size: str = "",
+    care_instructions: str = "",
     notes: str = "",
+    extra_image_paths: Optional[list[str]] = None,
+    extra_image_urls: Optional[list[str]] = None,
+    extra_image_base64: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Add a garment from a photo you have looked at, with the tags you judged yourself.
 
     wardrowbe's own AI tagging is skipped, so fill in every tag you can see.
 
-    Give the image one way:
+    Give the primary image one way:
       - image_base64: the file's bytes, base64-encoded (JPEG, PNG, WebP or HEIC).
         Practical only for small images.
       - image_path: a path on the machine running this server. Only accepted over
@@ -400,38 +464,40 @@ async def add_clothing_item(
     <server>/upload` creates the item untagged and returns its id; then call
     `update_item` with the tags.
 
+    extra_image_paths / extra_image_urls / extra_image_base64 add up to 3 more
+    photos (e.g. a price tag, a back view) to the same item in one call, 4 total.
+    Each is attached after the item is created, in list order; a bad one is skipped
+    rather than failing the whole call. image_path entries follow the same
+    stdio-only rule as above; extra_image_base64 is the one that works over HTTP
+    for a photo you (not the server) hold.
+
     Args:
         item_type: Garment type.
         image_filename: Original file name; its extension tells the image format.
         name: Short name, e.g. "Navy oxford shirt".
+        subtype: Free text, e.g. "blouson" for a jacket.
         color: The single dominant color.
         colors: All visible colors, dominant first.
         style, season: Lists, e.g. ["casual", "minimalist"], ["fall", "winter"].
+        size: Free text, e.g. "M" or "32x30".
+        care_instructions: Free text from a care label, if visible.
     """
-    if bool(image_base64) == bool(image_path):
-        raise ValueError("Provide exactly one of image_base64 or image_path")
-    if image_path:
-        if STDIO_IDENTITY is None:
-            raise ValueError(
-                "image_path is only available over stdio; over HTTP send image_base64 or use POST /upload"
-            )
-        path = Path(image_path).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError(f"No such image file: {path}")
-        content, image_filename = path.read_bytes(), path.name
-    else:
-        try:
-            content = base64.b64decode(image_base64, validate=True)
-        except (binascii.Error, ValueError) as e:
-            raise ValueError(f"image_base64 is not valid base64: {e}") from e
+    content, image_filename = _resolve_image_bytes(image_path, image_base64, image_filename)
 
-    return await _call(
+    item = await _call(
         ctx,
         "POST",
         "/items",
-        data=_item_form(item_type, name, brand, notes, color, colors, style, season, material, pattern, formality, fit),
+        data=_item_form(
+            item_type, name, brand, notes, color, colors, style, season, material, pattern, formality, fit,
+            subtype=subtype, size=size, care_instructions=care_instructions,
+        ),
         files={"image": (image_filename, content, _image_content_type(image_filename))},
     )
+    if extra_image_paths or extra_image_urls or extra_image_base64:
+        await _attach_extra_images(ctx, item["id"], extra_image_paths, extra_image_urls, extra_image_base64)
+        item = await _call(ctx, "GET", f"/items/{item['id']}")
+    return item
 
 
 
@@ -443,6 +509,7 @@ async def add_from_product(
     source_url: str = "",
     name: str = "",
     brand: str = "",
+    subtype: str = "",
     color: str = "",
     colors: Optional[list[str]] = None,
     style: Optional[list[str]] = None,
@@ -451,30 +518,52 @@ async def add_from_product(
     pattern: str = "",
     formality: str = "",
     fit: str = "",
+    size: str = "",
+    care_instructions: str = "",
     notes: str = "",
+    extra_image_paths: Optional[list[str]] = None,
+    extra_image_urls: Optional[list[str]] = None,
+    extra_image_base64: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Add a garment from a product photo on the web, with the tags you judged yourself.
 
-    wardrowbe downloads the image itself, so use this whenever the picture is at a
-    public http(s) URL (a shop's product photo). Private, loopback and redirecting
-    URLs are refused.
+    wardrowbe downloads the primary image itself, so use this whenever that picture
+    is at a public http(s) URL (a shop's product photo). Private, loopback and
+    redirecting URLs are refused.
+
+    extra_image_paths / extra_image_urls / extra_image_base64 add up to 3 more
+    photos (e.g. the user's own photo of the item, or its price tag) to the same
+    item in one call, 4 total. Each is attached after the item is created, in list
+    order; a bad one is skipped rather than failing the whole call. A path is only
+    honored over stdio; extra_image_base64 is the one that works over HTTP for a
+    photo you (not the server) hold.
 
     Args:
-        image_url: Direct URL of the image file, not of the product page.
+        image_url: Direct URL of the primary image file, not of the product page.
         item_type: Garment type.
         source_url: The product page; kept on the item so it can be bought again.
+        subtype: Free text, e.g. "blouson" for a jacket.
+        size: Free text, e.g. "M" or "32x30".
+        care_instructions: Free text from a care label, if visible.
         name, brand, color, colors, style, season, material, pattern, formality, fit,
         notes: As in `add_clothing_item`.
     """
-    return await _call(
+    item = await _call(
         ctx,
         "POST",
         "/items",
         data={
             "image_url": image_url,
-            **_item_form(item_type, name, brand, notes, color, colors, style, season, material, pattern, formality, fit, source_url),
+            **_item_form(
+                item_type, name, brand, notes, color, colors, style, season, material, pattern, formality, fit,
+                source_url=source_url, subtype=subtype, size=size, care_instructions=care_instructions,
+            ),
         },
     )
+    if extra_image_paths or extra_image_urls or extra_image_base64:
+        await _attach_extra_images(ctx, item["id"], extra_image_paths, extra_image_urls, extra_image_base64)
+        item = await _call(ctx, "GET", f"/items/{item['id']}")
+    return item
 
 
 
@@ -499,6 +588,9 @@ async def update_item(
     size: Optional[str] = None,
     care_instructions: Optional[str] = None,
     source_url: Optional[str] = None,
+    purchase_price: Optional[float] = None,
+    purchase_date: Optional[str] = None,
+    wash_interval: Optional[int] = None,
 ) -> dict[str, Any]:
     """Change an existing item. Only the fields you pass are changed; the rest keep
     their values. Use this to tag an item that was uploaded untagged, or to correct
@@ -510,6 +602,11 @@ async def update_item(
         color: The single dominant color.
         colors: All visible colors, dominant first.
         size: Free text, e.g. "M" or "32x30".
+        purchase_price: What the user paid, in their local currency's smallest
+            common unit (e.g. 1290 for NT$1,290), no currency symbol.
+        purchase_date: YYYY-MM-DD; leave unset if the purchase isn't confirmed/dated.
+        wash_interval: Wears between washes. Leave unset to keep wardrowbe's default
+            for the item's type.
     """
     fields = {
         "type": item_type,
@@ -520,6 +617,9 @@ async def update_item(
         "favorite": favorite,
         "primary_color": color,
         "colors": colors,
+        "purchase_price": purchase_price,
+        "purchase_date": purchase_date,
+        "wash_interval": wash_interval,
     }
     tags = {
         "style": style,
@@ -540,6 +640,43 @@ async def update_item(
         raise ValueError("Pass at least one field to change")
     return await _call(ctx, "PATCH", f"/items/{item_id}", json=body)
 
+
+
+@tool("Add an extra photo to an item", WRITE_OPEN_WORLD)
+async def add_item_image(
+    ctx: Context,
+    item_id: str,
+    image_path: str = "",
+    image_base64: str = "",
+    image_filename: str = "photo.jpg",
+    image_url: str = "",
+) -> dict[str, Any]:
+    """Attach one more photo to an existing item (e.g. a price tag, a back view),
+    up to 4 photos total including the primary one. The original image is kept as
+    uploaded; wardrowbe does not crop or remove its background.
+
+    Give the image exactly one way:
+      - image_path: a path on the machine running this server. Only accepted over
+        the stdio transport.
+      - image_base64: the file's bytes, base64-encoded (JPEG, PNG, WebP or HEIC).
+      - image_url: a public http(s) URL; wardrowbe downloads it itself. Private,
+        loopback and redirecting URLs are refused.
+
+    Returns the new image's id and signed URLs. Call `get_item` to see it listed
+    under the item's `additional_images`.
+    """
+    provided = (bool(image_path), bool(image_base64), bool(image_url))
+    if sum(provided) != 1:
+        raise ValueError("Provide exactly one of image_path, image_base64 or image_url")
+    if image_url:
+        return await _call(ctx, "POST", f"/items/{item_id}/images", data={"image_url": image_url})
+    content, image_filename = _resolve_image_bytes(image_path, image_base64, image_filename)
+    return await _call(
+        ctx,
+        "POST",
+        f"/items/{item_id}/images",
+        files={"image": (image_filename, content, _image_content_type(image_filename))},
+    )
 
 
 @tool("Log that an item was worn", WRITE)
